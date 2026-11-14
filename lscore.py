@@ -87,6 +87,15 @@ def human(n: float) -> str:
     return f"{n:.1f} TiB"
 
 
+def human2(n: float) -> str:
+    """Two decimals, so disk capacity matches tools like fastfetch exactly."""
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.2f} {unit}"
+        n /= 1024
+    return f"{n:.2f} TiB"
+
+
 def dir_size(path: str, budget: float = 4.0) -> Tuple[int, bool]:
     """Bytes used by a folder, counted like `du`: allocated blocks, hard links once.
     Returns (bytes, finished)."""
@@ -317,6 +326,41 @@ def parse_journal_bytes(text: str) -> Optional[int]:
     return int(float(m.group(1)) * mult[m.group(2)])
 
 
+_MOUNT_ESCAPE = re.compile(r"\\([0-7]{3})")
+
+# Pseudo filesystems describe the kernel or devices, not storage the user can fill.
+_PSEUDO_FS = frozenset({
+    "apparmorfs", "autofs", "binfmt_misc", "bpf", "cgroup", "cgroup2",
+    "configfs", "cramfs", "debugfs", "devpts", "devtmpfs", "efivarfs",
+    "erofs", "fusectl", "fuse.gvfsd-fuse", "fuse.lxcfs", "fuse.portal",
+    "hugetlbfs", "iso9660", "mqueue", "nsfs", "proc", "pstore", "ramfs",
+    "romfs", "rpc_pipefs", "securityfs", "selinuxfs", "smackfs",
+    "squashfs", "sysfs", "tracefs",
+})
+
+# A statvfs on a dead network mount can block forever; these belong to another machine.
+_NETWORK_FS = frozenset({
+    "9p", "afs", "ceph", "cifs", "davfs", "fuse.aftpfs", "fuse.ceph",
+    "fuse.curlftpfs", "fuse.davfs2", "fuse.gcsfuse", "fuse.glusterfs",
+    "fuse.httpdirfs", "fuse.juicefs", "fuse.moosefs", "fuse.obsfs",
+    "fuse.rclone", "fuse.s3fs", "fuse.sftpfs", "fuse.smbnetfs",
+    "fuse.sshfs", "glusterfs", "gpfs", "lustre", "ncpfs", "nfs", "nfs4",
+    "orangefs", "pvfs2", "smb3", "smbfs",
+})
+
+
+def parse_mounts(text: str) -> List[Tuple[str, str, str]]:
+    """(mountpoint, fstype, options) from /proc/self/mounts; octal escapes decoded."""
+    mounts = []
+    for line in text.splitlines():
+        cols = line.split()
+        if len(cols) < 4:
+            continue
+        mount = _MOUNT_ESCAPE.sub(lambda m: chr(int(m.group(1), 8)), cols[1])
+        mounts.append((mount, cols[2], cols[3]))
+    return mounts
+
+
 def parse_sshd_config(texts: List[str]) -> Dict[str, str]:
     """First value wins (like OpenSSH). Conditional `Match` blocks are ignored."""
     cfg: Dict[str, str] = {}
@@ -409,6 +453,18 @@ def battery_health() -> Optional[Tuple[float, str]]:
             f, d = read(f"{b}/{full}"), read(f"{b}/{design}")
             if f.isdigit() and d.isdigit() and int(d) > 0:
                 return min(100.0, int(f) / int(d) * 100), read(b + "/cycle_count")
+    return None
+
+
+def battery_charge_limit() -> Optional[int]:
+    """The active charge stop threshold in percent, if the firmware exposes one."""
+    for b in sorted(glob.glob("/sys/class/power_supply/BAT*")):
+        if read(b + "/type") != "Battery":
+            continue
+        for name in ("charge_control_end_threshold", "charge_stop_threshold"):
+            value = read(f"{b}/{name}")
+            if value.isdigit() and 0 < int(value) <= 100:
+                return int(value)
     return None
 
 
@@ -1070,14 +1126,17 @@ def c_telemetry(ctx: Ctx) -> Out:
 
 @check("Privacy", 3, "Encrypted DNS")
 def c_dns(ctx: Ctx) -> Out:
+    proxies = units_active(ctx, ["dnscrypt-proxy", "stubby"])
     status = resolvectl_status()
     if not (ctx.systemd and status):
+        if proxies:
+            return ok("An encrypted DNS proxy is running")
         return skip("systemd-resolved not in use")
     if "127.0.0.53" not in read("/etc/resolv.conf"):
         return skip("systemd-resolved isn't your active resolver")
     if "+DNSOverTLS" in status or re.search(r"DNSOverTLS[=:]\s*(yes|opportunistic)", status, re.I):
         return ok("DNS-over-TLS is on")
-    if units_active(ctx, ["dnscrypt-proxy", "stubby"]):
+    if proxies:
         return ok("An encrypted DNS proxy is running")
     cmd = ("# pick the DNS provider YOU trust; 'opportunistic' falls back if a network blocks port 853\n"
            "sudo mkdir -p /etc/systemd/resolved.conf.d\n"
@@ -1151,11 +1210,60 @@ def c_home(ctx: Ctx) -> Out:
 
 # Storage checks
 
+def _disk_paths(ctx: Ctx) -> List[str]:
+    """Local writable filesystems from the mount table, plus the usual system paths."""
+    paths = []
+    text = read("/proc/self/mounts") or read("/proc/mounts")
+    for mount, fstype, options in parse_mounts(text):
+        if _CTRL.search(mount) or fstype in _PSEUDO_FS or fstype in _NETWORK_FS:
+            continue
+        if fstype in ("tmpfs", "ramfs", "overlay", "aufs") and mount != "/":
+            continue
+        if "ro" in options.split(","):
+            continue
+        paths.append(mount)
+    paths.extend(("/", "/nix", "/var", "/boot", "/boot/efi", "/sysroot", ctx.home))
+    return list(dict.fromkeys(p for p in paths if p and not _CTRL.search(p)))
+
+
+def _is_removable(dev: int) -> bool:
+    """True when st_dev is a removable block device (USB stick, card reader)."""
+    try:
+        node = os.path.realpath(os.path.join(
+            "/sys/dev/block", f"{os.major(dev)}:{os.minor(dev)}"))
+    except (OSError, ValueError):
+        return False
+    for _ in range(3):
+        flag = read(os.path.join(node, "removable"))
+        if flag:
+            return flag == "1"
+        parent = os.path.dirname(node)
+        if parent == node:
+            break
+        node = parent
+    return False
+
+
+def _disk_label(path: str, home: str) -> str:
+    if home not in ("", "/") and (path == home or path.startswith(home + "/")):
+        return "~" + path[len(home):]
+    return path
+
+
+def _disk_cmd_path(path: str, home: str) -> str:
+    if home not in ("", "/") and path == home:
+        return "$HOME"
+    if home not in ("", "/") and path.startswith(home + "/"):
+        return "$HOME/" + shlex.quote(path[len(home) + 1:])
+    return shlex.quote(path)
+
+
 @check("Storage", 6, "Disk space")
 def c_disk(ctx: Ctx) -> Out:
-    """Judge the tightest filesystem that actually holds data; / alone may be a tmpfs."""
+    """Judge the tightest local filesystem that holds data; / alone may be a tmpfs."""
     seen, cands = set(), []
-    for path in ("/", "/nix", "/var", "/boot", "/sysroot", ctx.home):
+    home = os.path.abspath(ctx.home).rstrip(os.sep) or os.sep
+    for path in _disk_paths(ctx):
         try:
             st = os.statvfs(path)
             dev = os.stat(path).st_dev        # statvfs_result carries no device id
@@ -1163,29 +1271,48 @@ def c_disk(ctx: Ctx) -> Out:
             continue
         if not st.f_blocks or dev in seen:
             continue
+        if getattr(st, "f_flag", 0) & getattr(os, "ST_RDONLY", 1):
+            continue                          # read-only: 0 free is by design
+        if path != "/" and _is_removable(dev) and not (
+                home == path or home.startswith(path.rstrip("/") + "/")):
+            continue                          # a full USB stick is not machine health
+        frsize = st.f_frsize or getattr(st, "f_bsize", 0)
+        total = st.f_blocks * frsize
+        if total <= 0:
+            continue
         seen.add(dev)
-        total = st.f_blocks * st.f_frsize
-        avail = st.f_bavail * st.f_frsize
-        used = total - st.f_bfree * st.f_frsize
-        usable = used + avail
-        pct = 100 * avail / usable if usable else 0.0     # df's "free%" denominator
-        inode_pct = 100 * st.f_ffree / st.f_files if st.f_files else None
-        effective = min(pct, inode_pct) if inode_pct is not None else pct
-        cands.append((effective, avail, total, path, pct, inode_pct))
+        avail = max(0, min(st.f_bavail * frsize, total))
+        used = max(0, total - st.f_bfree * frsize)
+        reserved = max(0, total - used - avail)           # root-reserved blocks
+        used_pct = 100 * used / total if total else 0.0   # the same % fastfetch shows
+        free_pct = 100 * avail / total if total else 0.0  # what the thresholds judge
+        if st.f_files:
+            inode_pct = 100 * min(max(st.f_ffree, 0), st.f_files) / st.f_files
+        else:
+            inode_pct = None
+        effective = min(free_pct, inode_pct) if inode_pct is not None else free_pct
+        cands.append((effective, avail, total, path, free_pct, inode_pct,
+                      used_pct, used, reserved))
     if not cands:
         return skip("can't read disk usage")
-    _, avail, total, path, pct, inode_pct = min(cands, key=lambda c: (c[0], c[1]))
-    msg = f"{pct:.0f}% free ({human(avail)} of {human(total)})"
+    _, avail, total, path, free_pct, inode_pct, used_pct, used, reserved = min(
+        cands, key=lambda c: (c[0], c[1]))
+    label = _disk_label(path, home)
+    msg = (f"{used_pct:.0f}% used ({human2(used)} of {human2(total)}), "
+           f"{human2(avail)} free ({free_pct:.2f}%)")
+    if reserved and reserved * 100 >= total:            # at least 1% of the filesystem
+        msg += f", {human2(reserved)} reserved"
     if inode_pct is not None and inode_pct < 20:
         msg += f", inodes {inode_pct:.0f}% free"
     if path != "/":
-        msg += f" on {path}"
-    fix = (f"Find the big folders: `du -xh {shlex.quote(path)} --max-depth=2 "
+        msg += f" on {label}"
+    fix = (f"Find the big folders: `du -xh {_disk_cmd_path(path, home)} --max-depth=2 "
            f"2>/dev/null | sort -h | tail -15`")
-    effective = min(pct, inode_pct) if inode_pct is not None else pct
+    effective = min(free_pct, inode_pct) if inode_pct is not None else free_pct
+    # journald keeps 15% free by default (SystemKeepFree=); below 10% is critical.
     if effective < 10:
         return bad(msg, fix)
-    if effective < 20:
+    if effective < 15:
         return warn(msg, fix)
     return ok(msg)
 
@@ -1219,12 +1346,26 @@ def c_journal(ctx: Ctx) -> Out:
         return skip("needs systemd")
     _, out = run(["journalctl", "--disk-usage"])
     size = parse_journal_bytes(out)
-    if size is None:
-        return skip("can't read the journal size")
-    msg = f"Journal logs use {human(size)}"
-    if size <= GiB:
+    exact = True
+    if not size:
+        # A minimal journalctl can print 0 B when it cannot read the journal
+        # files (e.g. an unsupported compression feature). Count the bytes on
+        # disk instead, so a real journal is not reported as empty.
+        on_disk = 0
+        for path in ("/var/log/journal", "/run/log/journal"):
+            if os.path.isdir(path):
+                part, done = dir_size(path)
+                on_disk += part
+                exact = exact and done
+        if on_disk:
+            size = on_disk
+        elif size is None or not exact:
+            return skip("can't read the journal size")
+    msg = f"Journal logs use {'' if exact else 'at least '}{human(size)}"
+    # journald's default SystemMaxUse is 10% of the filesystem, capped at 4 GiB.
+    if size <= 4 * GiB:
         return ok(msg)
-    return (warn if size <= 4 * GiB else bad)(
+    return (warn if size <= 10 * GiB else bad)(
         msg, "Trim them, and cap future growth with SystemMaxUse=500M in /etc/systemd/journald.conf.",
         "sudo journalctl --vacuum-size=500M")
 
@@ -1246,8 +1387,8 @@ def c_trash(ctx: Ctx) -> Out:
     path = os.path.join(ctx.data_home, "Trash")
     if not os.path.isdir(path):
         return ok("Trash is empty")
-    size, _ = dir_size(path)
-    msg = f"Trash holds {human(size)}"
+    size, done = dir_size(path)
+    msg = f"Trash holds {'' if done else 'at least '}{human(size)}"
     if size < GiB:
         return ok(msg)
     cmd = "gio trash --empty" if shutil.which("gio") else "rm -rf ~/.local/share/Trash/files/* ~/.local/share/Trash/info/*"
@@ -1307,9 +1448,15 @@ def c_battery(ctx: Ctx) -> Out:
         return skip("battery capacity unavailable")
     pct, cycles = health
     msg = f"Battery holds {pct:.0f}% of its original capacity" + (f" ({cycles} cycles)" if cycles.isdigit() else "")
+    limit = battery_charge_limit()
+    if limit is not None and limit < 100:
+        msg += f"; charging capped at {limit}%"
+        fix = (f"Charging is already capped at {limit}%, which slows further wear. "
+               "Plan a replacement if runtime is too short.")
+    else:
+        fix = "Cap charging at 80% if supported (TLP or a BIOS setting) to slow wear."
     if pct >= 80:
         return ok(msg)
-    fix = "Cap charging at 80% if supported (TLP or a BIOS setting) to slow wear."
     return (warn if pct >= 60 else bad)(msg, fix)
 
 
@@ -1342,10 +1489,11 @@ def c_temp(ctx: Ctx) -> Out:
     if t is None:
         return skip("no CPU temperature sensor found")
     msg = f"CPU is at {t:.0f}{chr(176) if UNICODE else chr(32)}C right now"
-    if t <= 80:
+    # Laptop CPUs commonly run at 80-90 C under load; Intel's Tjmax is ~100 C.
+    if t <= 90:
         return ok(msg)
     fix = "Clean the fans/vents, check thermal paste, and make sure nothing is pinning the CPU."
-    return (warn if t <= 90 else bad)(msg, fix)
+    return (warn if t <= 95 else bad)(msg, fix)
 
 
 # Scoring
@@ -1528,6 +1676,20 @@ def big_number(n: int) -> List[str]:
     return rows if UNICODE else [r.replace("█", "#") for r in rows]
 
 
+_DISK_DETAIL_RE = re.compile(
+    r"^(\d+)% used \((.+?) of (.+?)\), (.+?) free \([\d.]+%\)")
+
+
+def disk_usage_line(detail: str, sep: str = " · ") -> str:
+    """Compact '78% used · 175.5 / 224.0 GiB (37.1 GiB free)' from c_disk."""
+    m = _DISK_DETAIL_RE.match(detail)
+    if not m:
+        return detail
+    pct, used, total, free = m.groups()
+    used_num = used.rsplit(" ", 1)[0] if " " in used else used
+    return f"{pct}% used{sep}{used_num} / {total} ({free} free)"
+
+
 def render(rep: Report, p: Callable[..., str], verbose: bool = False) -> None:
     U = UNICODE
     sym = {"pass": "✔" if U else "ok", "warn": "▲" if U else "!", "fail": "✖" if U else "x"}
@@ -1553,8 +1715,15 @@ def render(rep: Report, p: Callable[..., str], verbose: bool = False) -> None:
         if c in rep.cats:
             sc = rep.cats[c]
             n = round(sc / 100 * 20)
-            print(f"  {c:<15}" + p(full * n, CAT_COLOR[c]) + p(empty * (20 - n), "muted")
+            label = "Storage (health)" if c == "Storage" else c
+            print(f"  {label:<17}" + p(full * n, CAT_COLOR[c]) + p(empty * (20 - n), "muted")
                   + "  " + p(f"{sc:>3}", tone(sc)))
+            if c == "Storage":
+                disk = next((r for r in rep.results
+                             if r.id == "disk" and r.status != "skip"), None)
+                if disk and disk.detail:
+                    branch = "    └─ Disk        " if U else "    `- Disk        "
+                    print(p(branch, "soft") + p(disk_usage_line(disk.detail, dot), "text"))
     print()
 
     issues = sorted((r for r in rep.results if r.status in ("warn", "fail")), key=lambda r: -r.impact)

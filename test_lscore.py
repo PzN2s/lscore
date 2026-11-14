@@ -346,6 +346,42 @@ class TestOutput(unittest.TestCase):
             lscore.render(rep, lscore.make_painter(None))
         self.assertIn("Nothing to improve", out.getvalue())
 
+    def test_render_shows_disk_usage_when_the_disk_check_passes(self):
+        results = [R("Storage", 6, "pass", title="Disk space", rid="disk",
+                     detail="78% used (175.50 GiB of 224.02 GiB), "
+                            "37.07 GiB free (16.55%)")]
+        rep = lscore.build_report(results, {"distro": "TestOS", "kernel": "1",
+                                            "arch": "x86_64", "laptop": False})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            lscore.render(rep, lscore.make_painter(None))
+        text = out.getvalue()
+        self.assertIn("Storage (health)", text)
+        self.assertIn("└─ Disk        78% used · 175.50 / 224.02 GiB "
+                      "(37.07 GiB free)", text)
+
+    def test_render_shows_disk_usage_when_the_disk_needs_attention(self):
+        results = [R("Storage", 6, "warn", title="Disk space", rid="disk",
+                     detail="85% used (190.42 GiB of 224.02 GiB), "
+                            "33.60 GiB free (15.00%)")]
+        rep = lscore.build_report(results, {"distro": "TestOS", "kernel": "1",
+                                            "arch": "x86_64", "laptop": False})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            lscore.render(rep, lscore.make_painter(None))
+        text = out.getvalue()
+        self.assertIn("└─ Disk        85% used · 190.42 / 224.02 GiB "
+                      "(33.60 GiB free)", text)
+
+    def test_disk_usage_line_is_compact_and_falls_back(self):
+        self.assertEqual(
+            lscore.disk_usage_line(
+                "78% used (175.51 GiB of 224.02 GiB), 37.07 GiB free "
+                "(16.55%), 11.45 GiB reserved on /nix"),
+            "78% used · 175.51 / 224.02 GiB (37.07 GiB free)")
+        self.assertEqual(lscore.disk_usage_line("unexpected detail"),
+                         "unexpected detail")
+
     def test_badge_colors(self):
         for score, role in ((95, "foam"), (90, "foam"), (85, "foam"),
                             (84, "gold"), (70, "gold"), (69, "love"), (30, "love")):
@@ -588,7 +624,7 @@ class TestRegressions(unittest.TestCase):
                 mock.patch("os.stat", side_effect=fsstat):
             out = lscore.c_disk(ctx)
         self.assertEqual(out.status, "fail")
-        self.assertTrue(out.detail.startswith("5% free"), out.detail)
+        self.assertTrue(out.detail.startswith("95% used"), out.detail)
         self.assertIn("on /nix", out.detail)
 
     def test_disk_on_a_single_device_system_reads_like_before(self):
@@ -600,8 +636,9 @@ class TestRegressions(unittest.TestCase):
                 mock.patch("os.stat", side_effect=fsstat):
             out = lscore.c_disk(ctx)
         self.assertEqual(out.status, "pass")
-        expected = (f"80% free ({lscore.human(80000000 * 4096)} "
-                    f"of {lscore.human(100000000 * 4096)})")
+        expected = (f"20% used ({lscore.human2(20000000 * 4096)} of "
+                    f"{lscore.human2(100000000 * 4096)}), "
+                    f"{lscore.human2(80000000 * 4096)} free (80.00%)")
         self.assertEqual(out.detail, expected)
 
     def test_disk_without_any_readable_filesystem_skips(self):
@@ -653,6 +690,13 @@ class TestRegressions(unittest.TestCase):
         self.assertEqual(out.status, "warn")
         self.assertTrue(out.detail.startswith("System DNS lookups"), out.detail)
         self.assertNotIn("every site you visit", out.detail)
+
+    def test_dns_accepts_an_encrypted_proxy_without_systemd_resolved(self):
+        with mock.patch.object(lscore, "resolvectl_status", return_value=""), \
+                mock.patch.object(lscore, "units_active", return_value=["dnscrypt-proxy"]):
+            out = lscore.c_dns(lscore.Ctx())
+        self.assertEqual(out.status, "pass")
+        self.assertIn("encrypted DNS proxy", out.detail)
 
     def test_trim_ignores_removable_flash_drives(self):
         def fake_read(path):
@@ -1084,10 +1128,11 @@ class TestTrustFixes(unittest.TestCase):
     @staticmethod
     def _fake_fs(table, inodes=None):
         class Vfs:
-            def __init__(self, dev, blocks, bfree, bavail):
+            def __init__(self, dev, blocks, bfree, bavail, flag=0):
                 self.st_dev, self.f_frsize = dev, 4096
                 self.f_blocks, self.f_bfree, self.f_bavail = blocks, bfree, bavail
                 self.f_files, self.f_ffree = inodes or (0, 0)
+                self.f_bsize, self.f_flag = 4096, flag
 
         def fake_statvfs(path):
             if path not in table:
@@ -1110,10 +1155,120 @@ class TestTrustFixes(unittest.TestCase):
                 mock.patch("os.stat", side_effect=fsstat):
             return lscore.c_disk(mock.Mock(home=home))
 
-    def test_disk_percentage_matches_df_reserved_blocks(self):
-        # df divides by used+available, not by total.
+    def _disk_with_mounts(self, table, mounts, inodes=None, home="/home/someone"):
+        fsvfs, fsstat = self._fake_fs(table, inodes)
+        rows = []
+        for item in mounts:
+            options = item[2] if len(item) > 2 else "rw"
+            rows.append(f"/dev/x {item[0]} {item[1]} {options} 0 0")
+        text = "\n".join(rows)
+
+        def fake_read(path):
+            return text if path == "/proc/self/mounts" else ""
+
+        with mock.patch("os.statvfs", side_effect=fsvfs), \
+                mock.patch("os.stat", side_effect=fsstat), \
+                mock.patch.object(lscore, "read", side_effect=fake_read):
+            return lscore.c_disk(mock.Mock(home=home))
+
+    def test_parse_mounts_decodes_escaped_mountpoints(self):
+        text = (r"/dev/sda1 /mnt/my\040disk ext4 rw,relatime 0 0" "\n"
+                "tmpfs /tmp tmpfs rw 0 0")
+        self.assertEqual(lscore.parse_mounts(text), [
+            ("/mnt/my disk", "ext4", "rw,relatime"),
+            ("/tmp", "tmpfs", "rw"),
+        ])
+
+    def test_disk_checks_a_full_efi_partition(self):
+        table = {"/": (1, 100000, 80000, 80000),
+                 "/boot/efi": (2, 1000, 100, 50)}
+        out = self._disk_with_mounts(
+            table, [("/", "ext4"), ("/boot/efi", "vfat")])
+        self.assertEqual(out.status, "fail")
+        self.assertIn("on /boot/efi", out.detail)
+
+    def test_disk_checks_a_separate_data_mount(self):
+        table = {"/": (1, 100000, 80000, 80000),
+                 "/data": (2, 100000, 10000, 5000)}
+        out = self._disk_with_mounts(
+            table, [("/", "ext4"), ("/data", "ext4")])
+        self.assertEqual(out.status, "fail")
+        self.assertIn("on /data", out.detail)
+
+    def test_disk_ignores_read_only_filesystems(self):
+        table = {"/": (1, 100000, 80000, 80000, 1),
+                 "/data": (2, 100000, 10000, 5000)}
+        out = self._disk_with_mounts(
+            table, [("/", "ext4", "ro"), ("/data", "ext4")])
+        self.assertEqual(out.status, "fail")
+        self.assertIn("on /data", out.detail)
+
+    def test_disk_skips_when_only_read_only_filesystems_exist(self):
+        table = {"/": (1, 100000, 0, 0, 1)}
+        out = self._disk_with_mounts(table, [("/", "ext4", "ro")])
+        self.assertEqual(out.status, "skip")
+
+    def test_disk_ignores_network_and_non_root_tmpfs(self):
+        table = {"/": (1, 100000, 80000, 80000)}
+        out = self._disk_with_mounts(
+            table, [("/", "ext4"), ("/mnt/nas", "nfs4"), ("/run", "tmpfs")])
+        self.assertEqual(out.status, "pass")
+        self.assertTrue(out.detail.startswith("20% used"), out.detail)
+
+    def test_disk_ignores_a_full_removable_stick(self):
+        table = {"/": (1, 100000, 80000, 80000),
+                 "/media/usb": (2, 1000, 10, 10)}
+        with mock.patch.object(lscore, "_is_removable",
+                               side_effect=lambda dev: dev == 2):
+            out = self._disk_with_mounts(
+                table, [("/", "ext4"), ("/media/usb", "vfat")])
+        self.assertEqual(out.status, "pass")
+
+    def test_disk_falls_back_to_block_size_when_frsize_is_zero(self):
+        class Vfs:
+            f_blocks, f_bfree, f_bavail = 1000, 300, 200
+            f_frsize, f_bsize = 0, 4096
+            f_files = f_ffree = f_flag = 0
+
+        with mock.patch("os.statvfs", return_value=Vfs()), \
+                mock.patch("os.stat", return_value=mock.Mock(st_dev=1)), \
+                mock.patch.object(lscore, "read", return_value=""):
+            out = lscore.c_disk(mock.Mock(home="/home/someone"))
+        self.assertTrue(out.detail.startswith("70% used"), out.detail)
+        self.assertIn("2.73 MiB of 3.91 MiB), 800.00 KiB free (20.00%), "
+                      "400.00 KiB reserved", out.detail)
+
+    def test_disk_hides_the_home_path_in_detail_and_fix(self):
+        table = {"/home/someone": (1, 1000, 100, 50)}
+        out = self._disk_with_mounts(
+            table, [("/home/someone", "ext4")], home="/home/someone")
+        self.assertEqual(out.status, "fail")
+        self.assertIn("on ~", out.detail)
+        self.assertIn("$HOME", out.fix)
+        self.assertNotIn("someone", out.detail + out.fix)
+
+    def test_disk_percentage_uses_total_capacity_and_shows_reserved(self):
+        # Match fastfetch: used / total. Reserved blocks are shown separately
+        # so used + free + reserved still adds up to the total.
         out = self._disk({"/": (1, 1000, 300, 200)})
-        self.assertTrue(out.detail.startswith("22% free"), out.detail)
+        self.assertTrue(out.detail.startswith("70% used"), out.detail)
+        self.assertIn("2.73 MiB of 3.91 MiB), 800.00 KiB free (20.00%), "
+                      "400.00 KiB reserved", out.detail)
+
+    def test_disk_passes_at_the_fifteen_percent_safety_margin(self):
+        out = self._disk({"/": (1, 1000, 150, 150)})
+        self.assertEqual(out.status, "pass")
+        self.assertIn("15.00%", out.detail)
+
+    def test_disk_warns_below_the_fifteen_percent_safety_margin(self):
+        out = self._disk({"/": (1, 1000, 149, 149)})
+        self.assertEqual(out.status, "warn")
+        self.assertIn("14.90%", out.detail)
+
+    def test_disk_fails_below_ten_percent_free(self):
+        out = self._disk({"/": (1, 1000, 99, 99)})
+        self.assertEqual(out.status, "fail")
+        self.assertIn("9.90%", out.detail)
 
     def test_disk_reports_inode_exhaustion(self):
         out = self._disk({"/": (1, 100000, 80000, 80000)}, inodes=(1000, 2))
@@ -1126,6 +1281,116 @@ class TestTrustFixes(unittest.TestCase):
         out = self._disk(table)
         self.assertEqual(out.status, "fail")
         self.assertIn("on /boot", out.detail)
+
+    def test_trash_reports_a_timed_out_scan_as_a_lower_bound(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "Trash"))
+            ctx = mock.Mock(data_home=d)
+            with mock.patch.object(lscore, "dir_size",
+                                   return_value=(2 * lscore.GiB, False)):
+                out = lscore.c_trash(ctx)
+        self.assertEqual(out.status, "warn")
+        self.assertIn("at least 2.0 GiB", out.detail)
+
+    def test_journal_falls_back_to_disk_when_journalctl_reports_zero(self):
+        ctx = mock.Mock(systemd=True)
+        zero = "Archived and active journals take up 0B in the file system."
+        with mock.patch.object(lscore.shutil, "which",
+                               return_value="/usr/bin/journalctl"), \
+                mock.patch.object(lscore, "run", return_value=(0, zero)), \
+                mock.patch.object(lscore.os.path, "isdir",
+                                   side_effect=lambda p: p == "/var/log/journal"), \
+                mock.patch.object(lscore, "dir_size",
+                                   return_value=(5 * lscore.GiB, True)):
+            out = lscore.c_journal(ctx)
+        self.assertEqual(out.status, "warn")
+        self.assertIn("Journal logs use 5.0 GiB", out.detail)
+
+    def test_journal_fallback_marks_a_timed_out_scan_as_a_lower_bound(self):
+        ctx = mock.Mock(systemd=True)
+        zero = "Archived and active journals take up 0B in the file system."
+        with mock.patch.object(lscore.shutil, "which",
+                               return_value="/usr/bin/journalctl"), \
+                mock.patch.object(lscore, "run", return_value=(0, zero)), \
+                mock.patch.object(lscore.os.path, "isdir",
+                                   side_effect=lambda p: p == "/var/log/journal"), \
+                mock.patch.object(lscore, "dir_size",
+                                   return_value=(5 * lscore.GiB, False)):
+            out = lscore.c_journal(ctx)
+        self.assertEqual(out.status, "warn")
+        self.assertIn("at least 5.0 GiB", out.detail)
+
+    def test_journal_trusts_journalctl_when_it_reports_a_size(self):
+        ctx = mock.Mock(systemd=True)
+        real = "Archived and active journals take up 2.5G in the file system."
+        with mock.patch.object(lscore.shutil, "which",
+                               return_value="/usr/bin/journalctl"), \
+                mock.patch.object(lscore, "run", return_value=(0, real)), \
+                mock.patch.object(lscore, "dir_size",
+                                   side_effect=AssertionError("must not fall back")):
+            out = lscore.c_journal(ctx)
+        self.assertEqual(out.status, "pass")
+        self.assertIn("Journal logs use 2.5 GiB", out.detail)
+
+    def test_journal_accepts_the_systemd_default_four_gib_cap(self):
+        ctx = mock.Mock(systemd=True)
+        real = "Archived and active journals take up 4G in the file system."
+        with mock.patch.object(lscore.shutil, "which",
+                               return_value="/usr/bin/journalctl"), \
+                mock.patch.object(lscore, "run", return_value=(0, real)):
+            out = lscore.c_journal(ctx)
+        self.assertEqual(out.status, "pass")
+        self.assertIn("4.0 GiB", out.detail)
+
+    def test_journal_warns_above_the_default_cap_and_fails_above_ten_gib(self):
+        ctx = mock.Mock(systemd=True)
+        with mock.patch.object(lscore.shutil, "which",
+                               return_value="/usr/bin/journalctl"), \
+                mock.patch.object(lscore, "run",
+                                   return_value=(0, "journals take up 5G")), \
+                mock.patch.object(lscore, "dir_size",
+                                   side_effect=AssertionError("must not fall back")):
+            self.assertEqual(lscore.c_journal(ctx).status, "warn")
+        with mock.patch.object(lscore.shutil, "which",
+                               return_value="/usr/bin/journalctl"), \
+                mock.patch.object(lscore, "run",
+                                   return_value=(0, "journals take up 11G")), \
+                mock.patch.object(lscore, "dir_size",
+                                   side_effect=AssertionError("must not fall back")):
+            self.assertEqual(lscore.c_journal(ctx).status, "fail")
+
+    def test_battery_advice_respects_an_active_charge_limit(self):
+        with mock.patch.object(lscore, "battery_health",
+                               return_value=(71.0, "655")), \
+                mock.patch.object(lscore, "battery_charge_limit",
+                                   return_value=70):
+            out = lscore.c_battery(mock.Mock(laptop=True))
+        self.assertEqual(out.status, "warn")
+        self.assertIn("charging capped at 70%", out.detail)
+        self.assertIn("already capped at 70%", out.fix)
+        self.assertNotIn("Cap charging at 80%", out.fix)
+
+    def test_battery_advice_offers_a_limit_when_none_is_active(self):
+        with mock.patch.object(lscore, "battery_health",
+                               return_value=(71.0, "655")), \
+                mock.patch.object(lscore, "battery_charge_limit",
+                                   return_value=None):
+            out = lscore.c_battery(mock.Mock(laptop=True))
+        self.assertEqual(out.status, "warn")
+        self.assertIn("Cap charging at 80%", out.fix)
+        self.assertNotIn("already capped", out.fix)
+
+    def test_cpu_temp_accepts_normal_laptop_load_temperatures(self):
+        with mock.patch.object(lscore, "cpu_temp_c", return_value=90.0):
+            out = lscore.c_temp(mock.Mock())
+        self.assertEqual(out.status, "pass")
+        self.assertIn("90", out.detail)
+
+    def test_cpu_temp_warns_near_throttling_and_fails_above_it(self):
+        with mock.patch.object(lscore, "cpu_temp_c", return_value=91.0):
+            self.assertEqual(lscore.c_temp(mock.Mock()).status, "warn")
+        with mock.patch.object(lscore, "cpu_temp_c", return_value=96.0):
+            self.assertEqual(lscore.c_temp(mock.Mock()).status, "fail")
 
     # containers: /proc values belong to the host
     def test_container_skips_host_wide_memory_load_and_swap(self):
