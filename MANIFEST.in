@@ -1,0 +1,2 @@
+include man/lscore.1
+include test_lscore.py
