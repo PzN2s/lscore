@@ -1,0 +1,8 @@
+# Files copied in for a local makepkg run
+lscore.py
+LICENSE
+
+# makepkg output
+src/
+pkg/
+*.pkg.tar.*

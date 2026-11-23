@@ -1,0 +1,25 @@
+# Maintainer: lscore contributors
+pkgname=lscore
+pkgver=0.8.0
+pkgrel=1
+pkgdesc="A one-command health check for your Linux machine"
+arch=('any')
+license=('MIT')
+depends=('python')
+
+# Local build from a checkout:
+#   cp lscore.py LICENSE packaging/aur/
+#   cp man/lscore.1 packaging/aur/
+#   cd packaging/aur && makepkg -si
+#
+# For a release, point `source` at the tarball:
+#   source=("$pkgname-$pkgver.tar.gz::https://github.com/OWNER/lscore/archive/v$pkgver.tar.gz")
+# then run `updpkgsums` to replace SKIP with real checksums.
+source=("lscore.py" "LICENSE" "lscore.1")
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+package() {
+    install -Dm755 "$srcdir/lscore.py" "$pkgdir/usr/bin/lscore"
+    install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 "$srcdir/lscore.1" "$pkgdir/usr/share/man/man1/lscore.1"
+}

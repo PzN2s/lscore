@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.tmp
+lscore-card.svg
+fix.sh
+/result
+/dist/
+/build/
+/*.egg-info/
+.venv/
+.ruff_cache/

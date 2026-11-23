@@ -1,0 +1,379 @@
+.\" lscore-install-marker:0d3f5a1c9b7e
+.\" install.sh and uninstall.sh use this marker to recognize the page.
+.TH LSCORE 1 "2026-11-21" "lscore 0.8.0" "User Commands"
+.SH NAME
+lscore \- one-command health check for your Linux machine
+.SH SYNOPSIS
+.B lscore
+.RI [ options ]
+.SH DESCRIPTION
+.B lscore
+looks at the machine it runs on and prints a score from 0 to 100 with a letter
+grade, a breakdown by category, and the checks that need attention.
+Its checks are read-only and offline: they change nothing on the system, need no
+network access, and send no telemetry.
+The only files it writes are the local history (unless
+.B \-\-no-history
+is used), a card or metrics file you explicitly ask for, and a lock file next to
+the history.
+.B \-\-audit
+prints the complete list for a run.
+It uses only the Python 3 standard library.
+.PP
+Checks that do not apply to the current machine (for example a battery check on
+a desktop) are reported as not applicable and are left out of the score rather
+than counted as a pass.
+Nothing is printed that could not be determined on this machine.
+.PP
+By default the run is also appended to a local history file, so
+.B \-\-history
+can show how the score changed over time.
+.SH OPTIONS
+.SS Output
+.TP
+.B \-\-json
+Print a machine-readable JSON report instead of the normal display.
+.TP
+.B \-\-audit
+After the report, print every file the run read, every command it ran and every
+file it wrote.
+This is the proof that the checks only read the machine.
+The list includes local paths, so review it before pasting it in public.
+With
+.B \-\-json
+the same lists appear under an
+.B audit
+key.
+.TP
+.B \-\-redact
+With
+.BR \-\-audit ,
+replace the current user's home directory with
+.B $HOME
+in every printed path.
+Useful before sharing the audit in a bug report.
+Using it without
+.B \-\-audit
+is an error.
+.TP
+.BI \-\-prometheus " FILE"
+Write the score in the format used by node_exporter's textfile collector.
+The file is replaced atomically and is world-readable, so a collector running as
+another user can read it.
+The metrics are
+.BR lscore_score ,
+.BR lscore_grade_info ,
+.BR lscore_category_score ,
+.BR lscore_check_score ,
+.B lscore_issues
+and
+.BR lscore_last_run_timestamp_seconds .
+Each
+.B lscore_check_score
+is 1 for a pass, 0.5 for a warning and 0 for a failure; skipped checks are
+omitted.
+No network access is used.
+.TP
+.BI \-\-card [ FILE ]
+Save a shareable SVG card.
+The default file name is
+.IR lscore-card.svg .
+.TP
+.B \-\-share
+Print a short plain-text summary suitable for pasting into a post or chat.
+.TP
+.B \-\-badge
+Print a Markdown badge for a README.
+.TP
+.B \-\-fix
+Print a shell script with suggested fixes for review.
+Nothing is executed.
+.TP
+.BR \-q ", " \-\-quiet
+Print only the numeric score.
+.TP
+.BR \-v ", " \-\-verbose
+Show every check, including the ones that passed or were skipped.
+.TP
+.B \-\-list-checks
+List every check and exit.
+With
+.B \-\-json
+the list is machine-readable.
+An explicit
+.B \-\-only
+or
+.B \-\-skip
+on the command line narrows the list; filters from the config file do not.
+.TP
+.B \-\-debug
+Print tracebacks for checks that crash instead of hiding the error.
+.SS Selecting checks
+.TP
+.BI \-\-only " ID"
+Run only the named checks or categories.
+May be repeated, and accepts comma-separated values.
+.TP
+.BI \-\-skip " ID"
+Skip the named checks or categories.
+May be repeated, and accepts comma-separated values.
+.SS Comparison and history
+.TP
+.BI \-\-compare [ FILE ]
+Compare this run with an earlier one.
+With a
+.IR FILE ,
+the file must be a report saved by
+.BR "lscore \-\-json" .
+With no value, the newest entry in the local history file is used.
+The comparison adds a section after the normal output; it never changes the
+default display.
+History entries store the overall score, the number of checks covered and, since
+lscore 0.6.0, the category scores, but not per-check results.
+Per-check changes are therefore available only when comparing against a saved
+.B \-\-json
+report that includes check results.
+.TP
+.B \-\-fail-on-new
+Exit with status 1 if any check got worse than the report given to
+.BR \-\-compare .
+A change from pass to warn or fail, and from warn to fail, counts as a
+regression; fail to warn does not.
+Only checks present in both reports are compared, so a newer lscore with extra
+checks can still use an older baseline.
+Requires
+.B \-\-compare
+with a saved
+.B \-\-json
+report that includes per-check results.
+.TP
+.B \-\-history
+Show recorded scores over time, newest last, with a summary of runs, best,
+average, latest, and how long ago the last run was.
+.TP
+.B \-\-no-history
+Do not record this run in the local history file.
+.SS Appearance
+.TP
+.BI \-\-theme " NAME"
+Colour theme: 
+.B rose
+(the pastel default) or
+.B basic
+(plain 16 colours, easier to read on light terminals).
+.TP
+.BI \-\-color " WHEN"
+When to use colour: 
+.B auto
+(the default), 
+.B always
+or
+.BR never .
+.TP
+.B \-\-no-color
+Disable colour; the same as
+.BR "\-\-color never" .
+.TP
+.B \-\-ascii
+Use ASCII symbols and rules instead of Unicode.
+.SS Configuration
+.TP
+.BI \-\-config " FILE"
+Read defaults from
+.IR FILE .
+The file must exist and contain an
+.B [lscore]
+section; otherwise lscore exits with status 2.
+.TP
+.B \-\-no-config
+Ignore the config file for this run.
+.TP
+.B \-\-completion " SHELL"
+Print a completion script for
+.BR bash ,
+.B zsh
+or
+.B fish
+and exit.
+.TP
+.B \-\-version
+Print the version and exit.
+.TP
+.BR \-h ", " \-\-help
+Print a short help text and exit.
+.SS Exit status control
+.TP
+.BI \-\-min " N"
+Exit with status 1 if the score is below
+.IR N .
+Useful in CI.
+.TP
+.BI \-\-fail-on " LEVEL"
+Exit with status 1 when a check of the given severity is present:
+.B warn
+or
+.BR fail .
+.SH CONFIGURATION FILE
+lscore reads optional defaults from
+.IR $XDG_CONFIG_HOME/lscore/config.ini ,
+falling back to
+.IR ~/.config/lscore/config.ini .
+The file is only read; it is never created or modified.
+It must contain an
+.B [lscore]
+section with keys from the list below.
+Unknown keys and invalid values produce a warning on standard error and are
+ignored.
+Command-line flags take precedence over the file, which takes precedence over
+the environment and the built-in defaults.
+.PP
+Keys:
+.TP
+.B only
+Comma-separated checks or categories to run, like
+.BR \-\-only .
+.TP
+.B skip
+Comma-separated checks or categories to skip, like
+.BR \-\-skip .
+.TP
+.B min
+Integer threshold, like
+.BR \-\-min .
+.TP
+.B fail_on
+.B warn
+or
+.BR fail ,
+like
+.BR \-\-fail-on .
+.TP
+.B theme
+.B rose
+or
+.BR basic .
+.TP
+.B color
+.BR auto ,
+.B always
+or
+.BR never .
+.TP
+.B ascii
+Boolean; true is the same as
+.BR \-\-ascii .
+.TP
+.B no_history
+Boolean; true is the same as
+.BR \-\-no-history .
+.PP
+Booleans accept
+.BR 1/0 ,
+.BR true/false ,
+.BR yes/no
+and
+.BR on/off ,
+case-insensitively.
+.SH FILES
+.TP
+.I ~/.config/lscore/config.ini
+Optional configuration (or under
+.IR $XDG_CONFIG_HOME ).
+.TP
+.I ~/.local/state/lscore/history.jsonl
+Local score history, one JSON object per run (or under
+.IR $XDG_STATE_HOME ).
+The directory is created with mode 0700 and the file with mode 0600, so other
+users cannot read it.
+It never leaves the machine.
+Runs executed as root are not recorded, because a preserved
+.B HOME
+can leave a root-owned file that normal runs could no longer write.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+When set and not empty, colour is disabled in
+.B auto
+mode, following the usual convention.
+.TP
+.B LSCORE_THEME
+Default theme name when neither a flag nor the config file sets one.
+.TP
+.B LSCORE_NO_HISTORY
+When set to
+.BR 1 ,
+.BR true ,
+.B yes
+or
+.BR on ,
+this run is not recorded.
+.TP
+.B XDG_CONFIG_HOME
+Base directory for the optional config file.
+.TP
+.B XDG_STATE_HOME
+Base directory for the local history file.
+.SH EXIT STATUS
+.TP
+.B 0
+Success, and any
+.B \-\-min
+or
+.B \-\-fail-on
+condition was not tripped.
+.TP
+.B 1
+The score was below
+.BR \-\-min ,
+a
+.B \-\-fail-on
+condition was tripped, or
+.B \-\-fail-on-new
+found a regression.
+.TP
+.B 2
+An error occurred: bad arguments, an unreadable comparison or config file,
+.B \-\-compare
+had no recorded run to use,
+.B \-\-fail-on-new
+had no per-check baseline,
+.B \-\-redact
+was used without
+.BR \-\-audit ,
+a requested card or metrics file could not be written, or no check could run
+on this machine.
+.SH EXAMPLES
+.TP
+.B lscore
+Show the normal report.
+.TP
+.B lscore \-\-only security,storage \-\-verbose
+Inspect two categories in detail.
+.TP
+.B lscore \-\-json > before.json
+Save a report, then later compare against it:
+.B lscore \-\-compare before.json
+.TP
+.B lscore \-\-compare
+Compare with the last recorded run.
+.TP
+.B lscore \-\-min 80 \-\-fail-on warn
+Fail a CI job when the machine drops below 80 or raises a warning.
+.TP
+.B lscore \-\-compare before.json \-\-fail-on-new
+Fail a CI job only when a check got worse since the saved report.
+.TP
+.B lscore \-\-no-history \-\-share
+Print a shareable summary without recording the run.
+.TP
+.B lscore \-\-audit \-\-no-history
+Show every file and command the checks touched.
+.TP
+.B lscore \-q \-\-prometheus /var/lib/node_exporter/textfile_collector/lscore.prom
+Update the metrics file without printing a report; run it from cron or a timer.
+.SH SEE ALSO
+.BR python3 (1)
+.PP
+Project home and issue tracker: see the README shipped with the source.
+.SH AUTHORS
+Written for the lscore project and released under the MIT licence.
